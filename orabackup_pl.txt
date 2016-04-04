@@ -1,0 +1,1148 @@
+#!/usr/local/bin/perl
+$VERSION='2.05';
+#ora_backup.pl Amdo
+#####################################################
+#  Revisions:
+#  1.06 - Log email notifications, temporarily disable incremental rman
+#         backup support.
+#  1.07 - Fix problem with missing symbols & environment settings on
+#         VMS jobs run through the DEC scheduler.
+#  1.08 - Add debug mode
+#  1.09 - Add code to HotBkup & ColdBkup to list files backed up.
+#  1.10 - Add support for viewing logfiles via web interface.  Insert job
+#         history records using global_name rather than sid to ensure
+#         they are unique.
+#  1.11 - Testing/Minor changes for Oracle 9i added.  Bug fix for NT not
+#         purging old archive log backups (case sensitivity issue).  DEC
+#         alert added to VMS job failure notifications.
+#  1.12 - Bug fix for perl versions prior to 5.6 not properly handling
+#         files > 2GB.  Error is now trapped and handled.  Notifications
+#         to OPS are now sent only in the case of failure.  Notifications
+#         are sent only to DBA when jobs fail with "warning" status.
+#         Default FAILURE_SEVERITY set to minor when it can not be extracted
+#         from config table.
+#  1.13 - Bug Fix for "list backup of database" in 9i.  Added search
+#         for RMAN-06397 & RMAN-06393
+#  1.13NG - Export backup changed to use direct mode.
+#  1.14 - Added support for hot & cold backups to tape/mirror splits
+#  1.15 - Added "alter system archive log current" to hot backup process.
+#  2.0  - Complete rewrite.
+#       - Removed VMS support
+#       - Moved tables into OraWeb along with a new configuration module for OraWeb
+#       - Scripts are now stored via OraWeb.  All backup logic is in the stored scripts
+#       - Removed old fashioned Hot / Cold backups.  These can be run via an rman image copy
+#       - Every type of export can now be run as parfiles are stored from OraWeb
+#       - Logfiles are now stored inside the job_history table in a clob column
+#  2.01 - Removed "use strict" and switched most of the main vars to
+#         global vars.  The syntax for declaring/accessing global vars from subs
+#         changes slightly in perl 5.6 and hence to keep things as generic as
+#         possible everything was switched to simple global vars.
+#       - Fixed a couple of minor bugs in CleanAndExit sub
+#  2.02 - Fixed a bug in DelObsExpBkups that was causing multiple file exports
+#         to not be properly purged on unix.
+#  2.03 - Added switch logfile statement to end backup to force the current log
+#         out to the archivelog dest.
+#  2.04 - Added /bin to the default path to support Linux hosts
+#  2.05 - Updated CONFIG_DB variable to point to new oweb config schema on PRMAN
+#
+#####################################################
+
+require 5.000 ;
+
+#----------------------------------------------------------------------------
+# Name: GetTime
+# Desc: Returns formatted time in format --> "MON DD HH:MM:SS"
+#       Example --> "JAN 01 13:30:02"
+#----------------------------------------------------------------------------
+sub GetTime {
+
+my($SEC,$MIN,$HOUR,$MDAY,$MON)=(localtime())[0,1,2,3,4];
+my $MON=(qw(JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC))[$MON];
+sprintf("%s %02d %02d:%02d:%02d", $MON,$MDAY,$HOUR,$MIN,$SEC);
+
+}
+
+#----------------------------------------------------------------------------
+# Name: Tee
+# Desc: Prints input both to screen as well as to log file.
+#----------------------------------------------------------------------------
+sub Tee ($){
+
+print "@_";
+
+open (LOGFILE, ">>$LOGFILE") || die "FAILED TO OPEN $LOGFILE!, $!";
+print {LOGFILE} "@_";
+close (LOGFILE);
+
+}
+
+
+#----------------------------------------------------------------------------
+# Name: SetOracleEnv
+# Desc: Set the Oracle environment variables, so that we can access the
+#       database.
+#----------------------------------------------------------------------------
+sub SetOracleEnv ($){
+
+if ($#_ ne 0)
+{
+        die "SetOracleEnv - BAD PARAMETERS PASSED" if ($#_ ne 0);
+}
+
+my ($SID)=@_;
+my $SUCCESS=0;
+
+$SID='*' if ($SID eq "");
+
+if ($OS eq "WINDOWS")   # WINDOWS SPECIFIC
+{
+        $ENV{'ORACLE_SID'}="$SID";
+}  # END WINDOWS SPECIFIC
+
+
+if ($OS eq "UNIX")      # UNIX SPECIFIC
+{
+        if (-e "/etc/oratab")
+        {
+                $ORATAB="/etc/oratab";
+        }
+        elsif (-e "/var/opt/oracle/oratab")
+        {
+                $ORATAB="/var/opt/oracle/oratab";
+        }
+        else
+        {
+                print "$PROCNAME: ERROR: FAILED TO LOCATE ORATAB FILE!\n";
+                exit 2;
+        }
+
+        open (ORATAB, "<$ORATAB") || die "FAILED TO OPEN $ORATAB!, $!";
+
+        while(<ORATAB>)
+        {
+                chomp;
+                if (/:y$/i)
+                {
+                        ($ORACLE_SID, $ORACLE_HOME) = /^(.*?):(.*?):/;
+                        $ENV{'ORACLE_SID'}=$ORACLE_SID;
+                        $ENV{'ORACLE_HOME'}=$ORACLE_HOME;
+                        $PATH=$ENV{'PATH'};
+                        $ENV{'PATH'}="$ORACLE_HOME/bin:$PATH";
+                        $ENV{'SHLIB_PATH'}="$ORACLE_HOME/lib";
+                        $ENV{'TNS_ADMIN'}="$ORACLE_HOME/network/admin";
+
+                        if (((split(/:/,$_,2))[0] eq "$SID") || ($SID eq '*'))
+                        {
+                                $SUCCESS=1;
+                                last;
+                        }
+                }
+        }
+
+        close ORATAB;
+
+        if ($SUCCESS ne 1)
+        {
+                print "$PROCNAME: ERROR: VALID ORACLE_HOME NOT FOUND IN ORATAB FILE FOR SID - $SID!\n";
+                print "$PROCNAME: DEBUG: THIS SCRIPT MUST RUN FROM SERVER CONTAINING SPECIFIED DATABASE \n";
+                exit 2;
+        }
+}       #END UNIX SPECIFIC
+
+return
+} # End of SetOracleEnv
+
+
+
+#----------------------------------------------------------------------------
+# Name: ExecuteSql
+# Desc: Run a SQL Command, leave output in the temp file
+# for the calling routine to get, and set SqlError if an error was detected.
+#----------------------------------------------------------------------------
+sub ExecuteSql ($){
+
+if ($#_ ne 0)
+{
+        Tee "EXECUTESQL - BAD PARAMETERS PASSED";
+        $SQLERROR=1;
+        return;
+}
+
+my ($SQL)=@_;
+$SQL =~ s/\$/\\\$/g;
+
+$SQLERROR=0;
+
+unlink $TEMPFILE;
+
+if ($SQL ne "")
+{
+        qx(sqlplus -s -l "/ as sysdba" << EndOfSql > $TEMPFILE
+          set serveroutput on echo on feedback on heading on linesize 256 pagesize 0;
+          $SQL
+          exit;
+          EndOfSql
+        );
+
+$SQLERROR=1 if ($? ne 0);
+}
+else
+{
+        $SQLERROR=1;
+        return;
+}
+
+Tee "$SQL\n" if ($DEBUG eq 1);
+
+open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+while (<TEMPFILE>)
+{
+        Tee $_ if ($DEBUG eq 1);
+        $SQLERROR=1 if /ORA-/i;         # ERROR ORA- (GENERAL ORACLE ERROR)
+        $SQLERROR=1 if /SP2-/i;         # ERROR SP2- (SQLPLUS ERROR)
+}
+close (TEMPFILE);
+
+return
+} # End of ExecuteSql
+
+
+
+#----------------------------------------------------------------------------
+# Name: ExecuteSqlNet
+# Desc: Run a SQL Command via sqlnet, leave output in the temp file
+# for the calling routine to get, and set SqlError if an error was detected.
+# All VMS & NT functionality removed from this sub.
+#----------------------------------------------------------------------------
+sub ExecuteSqlNet ($$$$){
+
+if ($#_ ne 3)
+{
+        Tee "EXECUTESQLNET - BAD PARAMETERS PASSED\n";
+        $SQLERROR=1;
+        return;
+}
+
+my ($DBUSER,$DBPASSWORD,$DBNAME,$SQL)=@_;
+$SQL =~ s/\$/\\\$/g;
+$DBUSER =~ s/\$/\\\$/g;
+$DBPASSWORD =~ s/\$/\\\$/g;
+
+$SQLERROR=0;
+
+unlink $TEMPFILE;
+
+if ($SQL ne "")
+{
+        qx(sqlplus -s -l $DBUSER/$DBPASSWORD\@$DBNAME << EndOfSql > $TEMPFILE
+          set serveroutput on echo on feedback on heading on linesize 256 pagesize 0;
+          $SQL
+          exit;
+          EndOfSql
+        );
+
+        $SQLERROR=1 if ($? ne 0);
+}
+else
+{
+        $SQLERROR=1;
+        return;
+}
+
+Tee "$SQL\n" if ($DEBUG eq 1);
+
+open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+while (<TEMPFILE>)
+{
+        Tee $_ if ($DEBUG eq 1);
+        $SQLERROR=1 if /ORA-/i;         # ERROR ORA- (GENERAL ORACLE ERROR)
+        $SQLERROR=1 if /SP2-/i;         # ERROR SP2- (SQLPLUS ERROR)
+}
+close (TEMPFILE);
+
+return
+} # End of ExecuteSqlNet
+
+
+#----------------------------------------------------------------------------
+# Name: LoadLogfile
+# Desc: Run SqlLoader to load logfile to log table in config database
+#----------------------------------------------------------------------------
+sub LoadLogfile (){
+
+Tee "$PROCNAME: INFO: LOADING LOGFILE CONTENTS TO BKUP_JOB_HISTORY TABLE - ".GetTime."\n";
+
+# Purge the temporary table to keep the LOB segment size under control
+$SQLCMD=qq(truncate table bkup_loadlog;);
+
+&ExecuteSqlNet($CONFIG_USER,$CONFIG_PASSWORD,$CONFIG_DB,$SQLCMD);
+
+if ($SQLERROR ne 0)
+{
+        Tee "$PROCNAME: ERROR: LoadLogfile FAILED! - FAILED TRUNCATING BKUP_LOADLOG TABLE\n";
+
+        open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+        while (<TEMPFILE>)
+        {
+                Tee $_;
+        }
+        close (TEMPFILE);
+        return;
+}
+
+# Create sqlldr controlfile
+open (TEMPFILE, ">$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+print {TEMPFILE} "load data\ninfile *\ninto table bkup_loadlog\nreplace\nfields terminated by ','\n(\nfile_name,\ntext lobfile(file_name) terminated by eof\n)\nbegindata\n$LOGFILE\n";
+close (TEMPFILE);
+
+# Load the logfile to to config DB using sqlldr and check result
+qx(sqlldr $CONFIG_USER/$CONFIG_PASSWORD\@$CONFIG_DB control=$TEMPFILE log=/dev/null > /dev/null 2>&1);
+if ($? ne 0)
+{
+        Tee "$PROCNAME: ERROR: FAILED TO LOAD LOGFILE CONTENTS TO BKUP_JOB_HISTORY TABLE.\n";
+        return;
+}
+
+# Update the bkup_job_history with the log we just loaded
+$SQLCMD=qq(update bkup_job_history set log = (select text from bkup_loadlog where file_name = '$LOGFILE') where job_key=$JOB_KEY;);
+
+&ExecuteSqlNet($CONFIG_USER,$CONFIG_PASSWORD,$CONFIG_DB,$SQLCMD);
+
+if ($SQLERROR ne 0)
+{
+        Tee "$PROCNAME: ERROR: LoadLogfile FAILED! - UNABLE TO UPDATE BKUP_JOB_HISTORY\n";
+
+        open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+        while (<TEMPFILE>)
+        {
+                Tee $_;
+        }
+        close (TEMPFILE);
+        return;
+}
+
+return
+} # End of LoadLogfile
+
+#----------------------------------------------------------------------------
+# Name: ExecuteRman
+# Desc: Run an rman command, leave output in the temp file for the calling
+#       routine to get, and set RmanError if an error was detected.
+#----------------------------------------------------------------------------
+sub ExecuteRman ($){
+
+$RMANERROR=0;
+
+if ($#_ ne 0)
+{
+        Tee "EXECUTERMAN - BAD PARAMETERS PASSED";
+        $RMANERROR=1;
+        return;
+}
+
+my ($CMDFILE)=@_;
+
+unlink $TEMPFILE;
+
+if ( -e $CMDFILE )
+{
+        qx(rman msgno cmdfile=$SQLFILE >$TEMPFILE 2>$TEMPFILE);
+
+        $RMANERROR=1 if ($? ne 0);
+}
+else
+{
+        $RMANERROR=1;
+        return;
+}
+
+open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+while (<TEMPFILE>)
+{
+        Tee $_ if ($DEBUG eq 1);
+        # "RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ==============="
+        $RMANERROR=1 if /RMAN-00569/i;
+}
+close (TEMPFILE);
+
+return
+} # End of ExecuteRman
+
+
+#----------------------------------------------------------------------------
+# Name: AlterBkupMode
+# Desc: Enable / Disable backup mode in specified DB
+#----------------------------------------------------------------------------
+sub AlterBkupMode ($$) {
+
+die "ALTERBKUPMODE - BAD PARAMETERS PASSED" if ($#_ ne 1);
+
+my ($DB_SID,$MODE)=@_;
+my ($SQLCMD,$CNT,@CNT);
+
+if ($MODE eq "begin")
+{
+        Tee "$PROCNAME: INFO: ENABLING BACKUP MODE IN DB ($DB_SID) - ".GetTime."\n";
+
+        $SQLCMD=qq{alter database begin backup;}
+}
+else
+{
+        Tee "$PROCNAME: INFO: TAKING DB ($DB_SID) OUT OF BACKUP MODE - ".GetTime."\n";
+
+        $SQLCMD=qq{alter database end backup;
+        alter system switch logfile;};
+}
+
+&ExecuteSql($SQLCMD);
+
+if ($SQLERROR ne 0)
+{
+        Tee "$PROCNAME: ERROR: AlterBkupMode FAILED\n";
+        open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+        while (<TEMPFILE>)
+        {
+                Tee $_;
+        }
+        close (TEMPFILE);
+
+        &CleanupAndExit(2);
+}
+
+# Add output to LOGFILE
+open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+open (LOGFILE, ">>$LOGFILE") || die "FAILED TO OPEN $LOGFILE!, $!";
+while (<TEMPFILE>)
+{
+        print {LOGFILE} $_;
+}
+close (TEMPFILE);
+close (LOGFILE);
+
+# Ensure DB backup mode was correctly altered
+if ($MODE eq "begin")
+{
+        $SQLCMD=qq{set heading off echo off feedback off;
+        select 'NUM ACTIVE ='||count(*) from v\$backup where status='NOT ACTIVE';};
+}
+else
+{
+        $SQLCMD=qq{set heading off echo off feedback off;
+        select 'NUM ACTIVE ='||count(*) from v\$backup where status='ACTIVE';};
+}
+
+&ExecuteSql($SQLCMD);
+
+if ($SQLERROR ne 0)
+{
+        Tee "$PROCNAME: ERROR: AlterBkupMode FAILED\n";
+        open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+        while (<TEMPFILE>)
+        {
+                Tee $_;
+}
+        close (TEMPFILE);
+
+        &CleanupAndExit(2);
+}
+
+open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+@CNT=grep (/=/, <TEMPFILE>);
+close (TEMPFILE);
+
+$CNT=(split(/=/,$CNT[0]))[1];
+
+if ($CNT != 0)
+{
+        Tee "$PROCNAME: ERROR: AlterBkupMode FAILED!  FAILED RUNNING \"$BKUP_ID\" BACKUP.\n";
+        &CleanupAndExit(2);
+}
+
+} # End of AlterBkupMode
+
+
+#----------------------------------------------------------------------------
+# Name: GetJobKey
+# Desc: Ensure requested backup is not already running and retrieve a job key
+#----------------------------------------------------------------------------
+sub GetJobKey () {
+
+# Check if this requested backup is already running in this DB
+$SQLCMD=qq{set heading off echo off feedback off;
+select 'NUM ACTIVE ='||count(*) from bkup_job_history
+where db_sid='$DB_SID' and bkup_id='$BKUP_ID' and status='running'
+and start_time > sysdate-1;};
+
+&ExecuteSqlNet($CONFIG_USER,$CONFIG_PASSWORD,$CONFIG_DB,$SQLCMD);
+
+open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+@CNT=grep (/=/, <TEMPFILE>);
+close (TEMPFILE);
+
+$CNT=(split(/=/,$CNT[0]))[1];
+
+if ($CNT != 0)
+{
+        Tee "$PROCNAME: ERROR: GetJobKey FAILED - THE SPECIFIED BACKUP IS ALREADY RUNNING...\n";
+        Tee "$PROCNAME: DEBUG: THIS ERROR IS OFTEN CAUSED BY AN ABORTED JOB LEAVING AN ACTIVE ENTRY\n";
+        Tee "                  IN THE BKUP_JOB_HIST TABLE.  CHECK THE JOB HISTORY WEB INTERFACE\n";
+        Tee "                  AND CONTACT A DBA TO PURGE THE ENTRY IF IT IS ERRONEOUS.\n\n";
+        exit 2;
+}
+
+# Retrieve a job key from the job key sequence
+$SQLCMD=qq(select 'job_key=' || bkup_job_key_seq.nextval from dual;);
+
+&ExecuteSqlNet($CONFIG_USER,$CONFIG_PASSWORD,$CONFIG_DB,$SQLCMD);
+
+open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+my @JOB_KEY=grep (/=/, <TEMPFILE>);
+close (TEMPFILE);
+
+$JOB_KEY=(split(/=/,$JOB_KEY[0]))[1];
+chomp $JOB_KEY;
+
+if (($SQLERROR ne 0) || ($JOB_KEY eq ""))
+{
+        Tee "$PROCNAME: ERROR: GetJobKey FAILED - UNABLE TO RETRIEVE JOB_KEY FROM BKUP_JOB_KEY_SEQ.\n";
+        exit 2;
+}
+
+return $JOB_KEY;
+} # End of GetJobKey
+
+
+#----------------------------------------------------------------------------
+# Name: RmanBkup
+# Desc: Run specified RMAN script and check results.
+#----------------------------------------------------------------------------
+sub RmanBkup () {
+
+Tee "$PROCNAME: INFO: RUNNING RMAN BACKUP - ".GetTime."\n";
+
+# Construct rman cmdfile
+open (SQLFILE, ">$SQLFILE") || die "FAILED TO OPEN $SQLFILE!, $!";
+print {SQLFILE} "connect target /;\n";
+print {SQLFILE} "connect catalog ".$CATALOG_DB_USER."/".$CATALOG_DB_PASS."@".$CATALOG_DB.";\n";
+print {SQLFILE} "$CFG{'script_text'}\n";
+print {SQLFILE} "exit;\n";
+print {SQLFILE} "exit;\n";
+close (SQLFILE);
+
+# Execute RMAN backup script and check results
+&ExecuteRman($SQLFILE);
+
+# Append rman output to LOGFILE
+open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+open (LOGFILE, ">>$LOGFILE") || die "FAILED TO OPEN $LOGFILE!, $!";
+while (<TEMPFILE>)
+{
+        print {LOGFILE} $_;
+}
+close (TEMPFILE);
+close (LOGFILE);
+
+# Check for errors
+if ($RMANERROR ne 0)
+{
+        Tee "$PROCNAME: ERROR: RMAN BACKUP FAILED!  CHECK LOG FILE FOR DETAILS. - ".GetTime."\n";
+
+        open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+        while (<TEMPFILE>)
+        {
+                print $_;
+        }
+        close (TEMPFILE);
+
+        &CleanupAndExit(2);
+}
+
+} # End of RmanBkup
+
+#----------------------------------------------------------------------------
+# Name: LogHistory
+# Desc: Log entry to bkup_job_history table
+#----------------------------------------------------------------------------
+sub LogHistory ($$$$$$) {
+
+die "LOGHISTORY - BAD PARAMETERS PASSED" if ($#_ lt 1);
+
+my ($COMMAND,$JOB_KEY,$STATUS,$DB_SID,$BKUP_ID,$BKUP_TYPE)=@_;
+my (@CNT,$CNT);
+
+if ($COMMAND eq "start")
+{
+        $SQLCMD=qq(insert into bkup_job_history (job_key,db_sid,bkup_id,bkup_type,start_time,end_time,status)
+        values ($JOB_KEY,'$DB_SID','$BKUP_ID','$BKUP_TYPE',sysdate,null,'running'););
+
+        &ExecuteSqlNet($CONFIG_USER,$CONFIG_PASSWORD,$CONFIG_DB,$SQLCMD);
+
+        if ($SQLERROR ne 0)
+        {
+                Tee "$PROCNAME: ERROR: LogHistory FAILED - FAILED INSERTING RECORD TO BKUP_JOB_HISTORY TABLE.\n";
+
+                open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+                while (<TEMPFILE>)
+                {
+                        Tee $_;
+                }
+                close (TEMPFILE);
+
+                &CleanupAndExit(2);
+        }
+
+}
+elsif ($COMMAND eq "end")
+{
+        $SQLCMD=qq(update bkup_job_history set end_time=sysdate,status='$STATUS' where job_key=$JOB_KEY;);
+
+        &ExecuteSqlNet($CONFIG_USER,$CONFIG_PASSWORD,$CONFIG_DB,$SQLCMD);
+
+        if ($SQLERROR ne 0)
+        {
+                Tee "$PROCNAME: ERROR: LogHistory FAILED - FAILED UPDATING JOB_KEY $JOB_KEY RECORD IN BKUP_JOB_HISTORY\n";
+
+                open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+                while (<TEMPFILE>)
+                {
+                        Tee $_;
+                }
+                close (TEMPFILE);
+
+                $JOB_STATUS=1;
+        }
+
+}
+
+return ($JOB_KEY);
+} # End LogHistory
+
+
+
+#----------------------------------------------------------------------------
+# Name: GetBkupConfig
+# Desc: Returns hash containing the configuration record from the oraweb db
+#       for the specified DB_SID / BKUP_ID combination
+#----------------------------------------------------------------------------
+sub GetBkupConfig  ($$) {
+
+die "GetBkupConfig - BAD PARAMETERS PASSED" if ($#_ ne 1);
+my ($DB_SID,$BKUP_ID)=@_;
+my (%CFG);
+
+Tee "$PROCNAME: INFO: RETRIEVING CONFIGURATION RECORD ($DB_SID / $BKUP_ID) - ".GetTime."\n";
+
+$SQLCMD=qq(select 'bkup_type=' || BKUP_TYPE || chr(10) ||
+'bkup_dir=' || BKUP_DIR || chr(10) ||
+'num_online_bkup=' || NUM_ONLINE_BKUP || chr(10) ||
+'compression=' || COMPRESSION
+from bkup_config where db_sid='$DB_SID' and bkup_id='$BKUP_ID';);
+
+&ExecuteSqlNet($CONFIG_USER,$CONFIG_PASSWORD,$CONFIG_DB,$SQLCMD);
+
+if ($SQLERROR ne 0)
+{
+        Tee "$PROCNAME: ERROR: GetBkupConfig FAILED!\n";
+
+        open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+        while (<TEMPFILE>)
+        {
+                Tee $_;
+        }
+        close (TEMPFILE);
+
+        &CleanupAndExit(2);
+}
+
+open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+my @CFG=grep (/=/, <TEMPFILE>);
+close (TEMPFILE);
+
+foreach $CFG (@CFG)
+{
+        chomp $CFG;
+        my $KEY=(split(/=/,$CFG))[0];
+        my $VALUE=(split(/=/,$CFG))[1];
+        $CFG{lc($KEY)}=$VALUE;
+}
+
+if ($#CFG < 0)
+{
+        Tee "$PROCNAME: ERROR: GetBkupConfig FAILED! - NO CONFIG RECORD FOUND FOR ($DB_SID / $BKUP_ID)\n";
+        exit 2;
+}
+
+# Get script contents from DB if this is an rman or export backup
+if (($CFG{'bkup_type'} eq "rman") || ($CFG{'bkup_type'} eq "export"))
+{
+        $SQLCMD=qq{set heading off echo off feedback off;
+        select text from bkup_script where db_sid='$DB_SID' and bkup_id='$BKUP_ID' order by linenum;};
+
+        &ExecuteSqlNet($CONFIG_USER,$CONFIG_PASSWORD,$CONFIG_DB,$SQLCMD);
+
+        if ($SQLERROR ne 0)
+        {
+                Tee "$PROCNAME: ERROR: GetBkupConfig FAILED!\n";
+
+                open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+                while (<TEMPFILE>)
+                {
+                        Tee $_;
+                }
+                close (TEMPFILE);
+
+                &CleanupAndExit(2);
+        }
+
+        open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+        while (<TEMPFILE>)
+        {
+                $CFG{'script_text'} .= $_;
+        }
+        close (TEMPFILE);
+
+        if ($CFG{'script_text'} eq "")
+        {
+                Tee "$PROCNAME: ERROR: GetBkupConfig FAILED! - NO SCRIPT OR PARFILE FOUND FOR ($DB_SID / $BKUP_ID)\n";
+                &CleanupAndExit(2);
+        }
+}
+
+
+return (%CFG);
+} # End of GetBkupConfig
+
+
+#----------------------------------------------------------------------------
+# Name: GetGlobalVars
+# Desc: Returns hash containing necessary global variables configurable
+#       via OraWeb backup module
+#----------------------------------------------------------------------------
+sub GetGlobalVars  () {
+
+my (%GLOBALS);
+
+Tee "$PROCNAME: INFO: RETRIEVING GLOBAL CONFIGURATION FROM CONFIG DB - ".GetTime."\n";
+
+$SQLCMD=qq(select VARNAME || '=' || VALUE from bkup_globals;);
+
+&ExecuteSqlNet($CONFIG_USER,$CONFIG_PASSWORD,$CONFIG_DB,$SQLCMD);
+
+if ($SQLERROR ne 0)
+{
+        Tee "$PROCNAME: ERROR: GetGlobalVars FAILED!\n";
+
+        open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+        while (<TEMPFILE>)
+        {
+                Tee $_;
+        }
+        close (TEMPFILE);
+
+        &CleanupAndExit(2);
+}
+
+open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+my @VAR=grep (/=/, <TEMPFILE>);
+close (TEMPFILE);
+
+$CNT=0;
+foreach $VAR (@VAR)
+{
+        chomp $VAR;
+        my $KEY=(split(/=/,$VAR))[0];
+        my $VALUE=(split(/=/,$VAR))[1];
+        $GLOBALS{lc($KEY)}=$VALUE;
+        $CNT++;
+}
+
+if ($CNT == 0)
+{
+        Tee "$PROCNAME: ERROR: GetGlobalVars FAILED! - NO GLOBAL CONFIG RECORDS FOUND.\n";
+        &CleanupAndExit(2);
+}
+
+return (%GLOBALS);
+} # End of GetGlobalVars
+
+
+
+#----------------------------------------------------------------------------
+# Name: DelObsExpBkups
+# Desc: Remove obsolete export backup sets from host file system
+#----------------------------------------------------------------------------
+sub DelObsExpBkups () {
+
+Tee "$PROCNAME: INFO: PURGING OBSOLETE EXPORT BACKUP SETS - ".GetTime."\n";
+
+if ($OS eq "WINDOWS")   # BUILD LIST OF ALL FILES
+{
+        opendir ("BKUPDIR",(substr ($CFG{'bkup_dir'},0,-1)));
+        @FILES=readdir ("BKUPDIR");
+        closedir ("BKUPDIR");
+}
+else
+{
+        opendir ("BKUPDIR","$CFG{'bkup_dir'}");
+        @FILES=readdir ("BKUPDIR");
+        closedir ("BKUPDIR");
+}
+
+$STRING="$DB_SID"."_"."$BKUP_ID";
+
+foreach (@FILES) # build list of export files
+{
+        if (($OS eq "WINDOWS") && (! -d $CFG{'bkup_dir'}.$_) && (/$STRING.+\.dmp/i))
+        {
+                unless ($MTIME=(stat ("$CFG{'bkup_dir'}"."$_"))[9])
+                {
+                        Tee "$PROCNAME: ERROR: UNABLE TO STAT FILE $_ - $!\n";
+                        $JOB_STATUS=1;
+                        next;
+                }
+                $FILES{$_}=$MTIME;
+        }
+        elsif (($OS eq "UNIX") && (! -d $CFG{'bkup_dir'}.$_) && (/$STRING.+\.dmp.*aa$/i))
+        {
+                unless ($MTIME=(stat ("$CFG{'bkup_dir'}"."$_"))[9])
+                {
+                        Tee "$PROCNAME: ERROR: UNABLE TO STAT FILE $_ - $!\n";
+                        $JOB_STATUS=1;
+                        next;
+                }
+                $FILES{$_}=$MTIME;
+        }
+}
+
+$COUNT=1;
+
+foreach $FILE (sort {$FILES{$b} <=> $FILES{$a}} keys %FILES)
+{
+        if ($COUNT ge $CFG{'num_online_bkup'})
+        {
+                if ($OS eq "WINDOWS")   # WINDOWS SPECIFIC
+                {
+                        system ("del \/Q $CFG{'bkup_dir'}"."$_ >NUL: 2>&1");
+                }       # END WINDOWS SPECIFIC
+                elsif ($OS eq "UNIX")   # UNIX SPECIFIC
+                {
+                        # -- Begin 2.02 changes
+                        $FILE=substr($FILE,0,index($FILE,"\.dmp"))."\.*";
+                        # -- End 2.02 changes
+                        system ("find $CFG{'bkup_dir'}"."$FILE -print -exec rm -f {} \\; 2>/dev/null");
+                }       # END UNIX SPECIFIC
+        }
+        $COUNT=($COUNT+1);
+}
+
+return
+} # End of DelObsExpBkups
+
+
+
+#----------------------------------------------------------------------------
+# Name: ExportDB
+# Desc: Run export of specified DB using parameter file provided
+#----------------------------------------------------------------------------
+sub ExportDB () {
+
+$EXPFILE="$CFG{'bkup_dir'}"."$DB_SID"."_"."$BKUP_ID"."_"."$JOB_DATE".".dmp";
+$EXPPIPE="$CFG{'bkup_dir'}"."/"."$DB_SID"."_"."$BKUP_ID"."_pipe.dmp";
+
+Tee "$PROCNAME: INFO: RUNNING EXPORT OF DB ($DB_SID / $BKUP_ID) - ".GetTime."\n";
+Tee "$PROCNAME: INFO: EXPORT FILE ($EXPFILE*) - ".GetTime."\n";
+
+# Construct export parfile
+open (SQLFILE, ">$SQLFILE") || die "FAILED TO OPEN $SQLFILE!, $!";
+print {SQLFILE} "$CFG{'script_text'}\n";
+close (SQLFILE);
+
+if ($OS eq "WINDOWS")   # WINDOWS SPECIFIC
+{
+        system ("exp \"/ as sysdba\" FILE=$EXPFILE PARFILE=$SQLFILE >$TEMPFILE 2>&1");
+}
+elsif ($OS eq "UNIX")   # UNIX SPECIFIC
+{
+        system ("rm -f $EXPPIPE >/dev/null 2>&1");      # Remove export pipe
+        system ("mknod $EXPPIPE p >/dev/null 2>&1"); # Create export pipe
+
+        if ($CFG{'compression'} == 1)
+        {
+                system ("compress < $EXPPIPE | split -b 2047m - $EXPFILE".".Z &"); # Split export into 2GB files
+        }
+        else
+        {
+                system ("cat $EXPPIPE | split -b 2047m - $EXPFILE"." &"); # Split export into 2GB files
+        }
+
+        if (! -e $EXPPIPE )
+        {
+                Tee "$PROCNAME: ERROR: ExportDB FAILED!  FAILED TO CREATE EXPORT PIPE. - ".GetTime."\n";
+                &CleanupAndExit(2);
+        }
+
+        system ("exp \\\"/ as sysdba\\\" FILE=$EXPPIPE PARFILE=$SQLFILE >$TEMPFILE 2>&1"); # Run export
+}
+
+# Append export log to LOGFILE
+open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+open (LOGFILE, ">>$LOGFILE") || die "FAILED TO OPEN $LOGFILE!, $!";
+while (<TEMPFILE>)
+{
+        print {LOGFILE} $_;
+}
+close (TEMPFILE);
+close (LOGFILE);
+
+# Check for errors
+open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+my $ERROR=grep (/Export terminated successfully without warnings/i, <TEMPFILE>);
+close (TEMPFILE);
+
+if ($ERROR eq 0)
+{
+        Tee "$PROCNAME: ERROR: ExportDB FAILED!  CHECK LOG FILE FOR DETAILS. - ".GetTime."\n";
+
+        open (TEMPFILE, "<$TEMPFILE") || die "FAILED TO OPEN $TEMPFILE!, $!";
+        while (<TEMPFILE>)
+{
+                print $_;
+        }
+        close (TEMPFILE);
+
+        &CleanupAndExit(2);
+}
+
+# Windows env requires compress to be run separately
+if (($CFG{'compression'}) && ($OS eq "WINDOWS"))
+{
+        Tee "$PROCNAME: INFO: COMPRESSING EXPORT FILE - ".GetTime."\n";
+
+        # Ensure we have the compress program available
+        if ( -e $SHELLDIR."compress" )
+        {
+                $RC=system ("$SHELLDIR"."compress -r $EXPFILE");
+
+                if ($RC ne 0)
+                {
+                        Tee "$PROCNAME: ERROR: FAILED TO COMPRESS EXPORT FILE - $! - ".GetTime."\n";
+                        $JOB_STATUS=1;
+                }
+                else
+                {
+                        # Compress was successful.  Delete export file
+                        system ("del \/Q $EXPFILE >NUL: 2>&1");
+                }
+        }
+        else
+        {
+                Tee "$PROCNAME: ERROR: FAILED TO COMPRESS EXPORT FILE - $! - ".GetTime."\n";
+                Tee "$PROCNAME: DEBUG: ENSURE YOU HAVE A COPY OF THE COMPRESS PROGRAM IN THE SAME DIRECTORY AS $PROCNAME\n\n";
+
+        }
+}
+
+return
+} # End of ExportDB
+
+#----------------------------------------------------------------------------
+# Name: CleanupAndExit
+# Desc: Verify that job completed successfully, populate job history
+#       table with completion information.  If job completed successfully
+#       cleanup temp files; otherwise leave them for debugging.  Exit with
+#       specified return code
+#----------------------------------------------------------------------------
+sub CleanupAndExit ($) {
+
+die "CleanupAndExit - BAD PARAMETERS PASSED" if ($#_ ne 0);
+my ($STATUS)=@_;
+
+Tee "$PROCNAME: INFO: CHECKING JOB STATUS & PROCESSING CLEANUP - ".GetTime."\n";
+
+$STATUS_TEXT="success" if ($STATUS eq 0);
+$STATUS_TEXT="warning" if ($STATUS eq 1);
+$STATUS_TEXT="failed" if ($STATUS eq 2);
+
+if ($JOB_KEY ne "")
+{
+        &LogHistory('end',$JOB_KEY,$STATUS_TEXT);
+}
+else
+{
+        Tee "$PROCNAME: WARNING: UNABLE TO UPDATE JOB_HISTORY TABLE.  NO JOB_KEY SPECIFIED.\n";
+}
+
+if ($STATUS ne 0)       # JOB FAILURE PROCESSING
+{
+        Tee "$PROCNAME: WARNING: BACKUP COMPLETED WITH ONE OR MORE ERRORS.  COMPLETION STATUS = $STATUS_TEXT - ".GetTime."\n";
+        Tee "$PROCNAME: DEBUG: TEMPFILE=$TEMPFILE - ".GetTime."\n";
+        Tee "$PROCNAME: DEBUG: LOGFILE=$LOGFILE - ".GetTime."\n";
+
+        &LoadLogfile;
+
+        # Send email notifications
+        foreach (@EMAIL)
+        {
+                Tee "$PROCNAME: INFO: SENDING EMAIL - $_ - ".GetTime."\n";
+                system ("$SHELLDIR"."blat $LOGFILE -q -server $SMTP_SERVER -f ora_backup -t $_ -s \"$HOSTNAME: ".uc($DB_SID)." - Backup Errors\"") if ($OS eq "WINDOWS");
+                system ("cat $LOGFILE | mailx -s \"$HOSTNAME: ".uc($DB_SID)." - Backup Errors\" \"$_\"") if ($OS eq "UNIX");
+        }
+}
+else    # JOB SUCCESSFUL PROCESSING
+{
+        Tee "$PROCNAME: BACKUP COMPLETED SUCCESSFULLY - ".GetTime."\n";
+        &LoadLogfile;
+        system ("rm $TEMPFILE 2>/dev/null");
+}
+
+exit ($STATUS);
+} # End of CleanupAndExit
+
+
+
+#----------------------------------------------------------------------------
+# Main Section
+#----------------------------------------------------------------------------
+sub Main {
+}
+
+$PROCNAME="ora_backup";
+
+# Check input
+if (($#ARGV lt 1) || ($#ARGV gt 2))
+{
+        print "$PROCNAME: USAGE: $PROCNAME <SID> <BACKUP_ID> <-debug>\n";
+        exit 2;
+}
+
+
+# Identify the operating system we're running from
+if (-e "C:\\")                  # WINDOWS SPECIFIC
+{
+        $OS="WINDOWS";
+        my $x=rindex($0,"\\");
+        if ($x ne -1)
+        {
+                $SHELLDIR=substr($0,0,($x+1));
+        }
+        else
+        {
+                $SHELLDIR=".\\";
+        }
+        $HOSTNAME=uc(`hostname`);
+        chomp $HOSTNAME;
+        $TEMPDIR="C:\\TEMP\\";
+        $TEMPDIRCHK=substr ($TEMPDIR,0,-1);     #Strip off trailing "\" needed to check if tempdir exists
+        umask 036;
+}                               # END WINDOWS SPECIFIC
+elsif (-e "/usr/bin")           # UNIX SPECIFIC
+{
+        $OS="UNIX";
+        my $x=rindex($0,"\/");
+        if ($x ne -1)
+        {
+                $SHELLDIR=substr($0,0,($x+1));
+        }
+        else
+        {
+                $SHELLDIR=".\/";
+        }
+        $HOSTNAME=uc(`hostname`);
+        chomp $HOSTNAME;
+        $TEMPDIR="/tmp/";
+        $TEMPDIRCHK=$TEMPDIR;
+        $ENV{'PATH'}="/bin:/usr/bin:/usr/sbin";
+        umask 036;
+}                               # END UNIX SPECIFIC
+else
+{
+        print "$PROCNAME: ERROR: UNSUPPORTED OPERATING SYSTEM\n";
+        exit 2;
+}
+
+if (! -d $TEMPDIRCHK)
+{
+        print "$PROCNAME: ERROR: TEMPDIR $TEMPDIR NOT AVAILABLE! CHECK DIRECTORY AND PERMISSIONS - ".GetTime."\n";
+        exit 2;
+}
+
+# Initialize required global variables
+$PID=$$;
+($MIN,$HOUR,$MDAY,$MON,$YEAR)=(localtime())[1,2,3,4,5,];
+$MON=(qw(jan feb mar apr may jun jul aug sep oct nov dec))[$MON];
+$JOB_DATE=sprintf("%s%02d_%02d%02d", $MON,$MDAY,$HOUR,$MIN);
+$START_TIME=sprintf("%s-%02d-%04d %02d:%02d", $MON,$MDAY,($YEAR + 1900),$HOUR,$MIN);
+$JOB_STATUS=0;
+$TEMPFILE="$TEMPDIR"."$PROCNAME"."_"."$PID".".tmp";
+$SQLFILE="$TEMPDIR"."$PROCNAME"."_"."$PID".".sql";
+$LOGFILE="$TEMPDIR"."$PROCNAME"."_"."$PID".".log";
+
+$DB_SID=lc @ARGV[0];
+$BKUP_ID=lc @ARGV[1];
+$DEBUG=1 if (grep (/-debug/i,@ARGV) gt 0);
+
+$CONFIG_DB = "prman.sbcdo.com";
+$CONFIG_USER = "oweb_prod";
+$CONFIG_PASSWORD = "ow3b4u";
+
+Tee uc($PROCNAME)." - VERSION $VERSION\n";
+Tee "$PROCNAME: INFO: LAUNCHING BACKUP PROCESS - ".GetTime."\n";
+
+# Set Oracle Env Variables
+&SetOracleEnv($DB_SID);
+
+# Retrieve global records from the config DB
+%GLOBALS=&GetGlobalVars();
+$CATALOG_DB_USER = $GLOBALS{'catalog_db_user'};
+$CATALOG_DB_PASS = $GLOBALS{'catalog_db_pass'};
+$CATALOG_DB = $GLOBALS{'catalog_db'};
+$SMTP_SERVER = $GLOBALS{'smtp_server'};
+@EMAIL = (split(/,/,$GLOBALS{'email_addresses'}));
+
+# Retrieve configuration record for this backup
+%CFG = ('bkup_type' => 'alterdb', 'bkup_dir' => $TEMPDIR) if (($BKUP_ID eq "begin") || ($BKUP_ID eq "end"));
+%CFG = &GetBkupConfig($DB_SID,$BKUP_ID) unless (($BKUP_ID eq "begin") || ($BKUP_ID eq "end"));
+
+# Ensure backup directory exists if we're running anything other than an RMAN backup
+if ($CFG{'bkup_type'} ne "rman")
+{
+        $BKUPDIRCHK=$CFG{'bkup_dir'};
+        #Strip off trailing "\" needed to check if bkupdir exists if we're on Windows
+        $BKUPDIRCHK=substr ($CFG{'bkup_dir'},0,-1) if ($OS eq "WINDOWS");
+
+        if (! -d $BKUPDIRCHK)
+        {
+                Tee "$PROCNAME: ERROR: SPECIFIED BACKUP DIRECTORY NOT FOUND! - ".GetTime."\n";
+                &CleanupAndExit(2);
+        }
+}
+
+# Retrieve a new job_key for this job
+$JOB_KEY = &GetJobKey();
+
+# Add record to bkup_job_hist table
+&LogHistory('start',$JOB_KEY,'running',$DB_SID,$BKUP_ID,$CFG{'bkup_type'});
+
+# Process requested backup type
+if ($CFG{'bkup_type'} eq "alterdb")
+{
+        &AlterBkupMode($DB_SID,$BKUP_ID);
+        &CleanupAndExit($JOB_STATUS);
+}
+elsif ($CFG{'bkup_type'} eq "export")
+{
+        &DelObsExpBkups();
+        &ExportDB();
+        &CleanupAndExit($JOB_STATUS);
+}
+elsif ($CFG{'bkup_type'} eq "rman")
+{
+        &RmanBkup();
+        &CleanupAndExit($JOB_STATUS);
+}
+else
+{
+        print "$PROCNAME: ERROR: UNSUPPORTED BACKUP TYPE SPECIFIED!\n";
+        print "$PROCNAME: USAGE: $PROCNAME <SID> <BKUPTYPE>\n";
+        exit 2;
+}
